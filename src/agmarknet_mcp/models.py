@@ -1,50 +1,6 @@
 # pyrefly: ignore [missing-import]
-from pydantic import BaseModel, Field
-from typing import List, Optional
-
-class CommodityPrice(BaseModel):
-    """
-    Represents a single commodity price record from Agmarknet.
-    """
-    state: str
-    district: str
-    market: str
-    commodity: str
-    variety: str
-    arrival_date: str
-    min_price: float = Field(alias="min_price")
-    max_price: float = Field(alias="max_price")
-    modal_price: float = Field(alias="modal_price")
-
-class ApiResponse(BaseModel):
-    """
-    Represents the top-level response envelope from data.gov.in.
-    """
-    index_name: str
-    title: str
-    desc: str
-    created: int
-    updated: int
-    created_date: str
-    updated_date: str
-    active: str
-    visualizable: str
-    catalog_uuid: str
-    source: str
-    org_type: str
-    org: list[str]
-    sector: list[str]
-    field: list[dict]
-    target_bucket: dict
-    message: str
-    version: str
-    status: str
-    total: int
-    count: int
-    limit: str
-    offset: str
-    records: List[CommodityPrice]
-
+from pydantic import BaseModel
+from typing import Optional
 
 # ---------------------------------------------------------------------------
 # CEDA Agri Market API models
@@ -53,6 +9,7 @@ class ApiResponse(BaseModel):
 # referenced by a numeric id rather than a name. These models mirror the raw
 # JSON each endpoint returns, so pydantic validates the shape for us before we
 # start working with the data.
+
 
 class Commodity(BaseModel):
     """One row from GET /agmarknet/commodities."""
@@ -79,13 +36,15 @@ class Market(BaseModel):
 class PriceRecord(BaseModel):
     """A raw price row exactly as POST /agmarknet/prices returns it.
 
-    Note it carries *ids*, not names, and no variety field.
+    Note it carries *ids*, not names, and no variety field. The response shape
+    depends on granularity: a state-level query returns aggregated rows that
+    omit district_id/market_id, so both are optional.
     """
     date: str
     commodity_id: int
     census_state_id: int
-    census_district_id: int
-    market_id: int
+    census_district_id: Optional[int] = None
+    market_id: Optional[int] = None
     min_price: float
     max_price: float
     modal_price: float

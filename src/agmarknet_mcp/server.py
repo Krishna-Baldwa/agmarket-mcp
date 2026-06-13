@@ -1,138 +1,163 @@
-from typing import Optional
+from typing import Optional, List, Tuple
 # pyrefly: ignore [missing-import]
 from mcp.server.fastmcp import FastMCP
-from .api import AgmarknetClient
+from .api import CedaClient
+from .models import PriceObservation
 
-# 1. Initialize the FastMCP server
-# This automatically handles the MCP protocol, stdio transport, and JSON-RPC
+# 1. Initialize the FastMCP server.
+# This automatically handles the MCP protocol, stdio transport, and JSON-RPC.
 mcp = FastMCP("agmarknet-mcp")
 
-# Initialize our API client (using mock data by default since the govt API is blocked)
-api_client = AgmarknetClient(use_mock=True)
+# 2. Initialize our API client once, reused by every tool.
+# (Reads CEDA_API_KEY from the environment / .env file.)
+client = CedaClient()
+
+
+def _latest_observations(
+    observations: List[PriceObservation],
+) -> Tuple[Optional[str], List[PriceObservation]]:
+    """Reduce a multi-day result to just the most recent date present.
+
+    CEDA data is historical and lags by months, so "the current price" really
+    means "the price on the latest date we have data for". This finds that date
+    and returns (date, rows_on_that_date).
+    """
+    if not observations:
+        return None, []
+    latest = max(o.date for o in observations)
+    return latest, [o for o in observations if o.date == latest]
+
 
 @mcp.tool()
 def get_commodity_price(
     commodity: str,
-    state: Optional[str] = None,
+    state: str,
     district: Optional[str] = None,
-    market: Optional[str] = None,
+    date: Optional[str] = None,
 ) -> str:
-    """Get current daily wholesale prices for a specific commodity.
-    
-    Returns min, max, and modal prices from today's Agmarknet data.
+    """Get wholesale prices (min/max/modal, Rs/quintal) for a commodity.
+
+    `state` is required. Provide `district` for per-mandi prices, or omit it for
+    a state-wide average. `date` is 'YYYY-MM-DD'; if omitted, the latest
+    available date is used (the data is historical and updated periodically).
     """
-    filters = {"commodity": commodity}
-    if state: filters["state"] = state
-    if district: filters["district"] = district
-    if market: filters["market"] = market
-        
-    prices = api_client.fetch_prices(filters=filters)
-    
-    if not prices:
-        return f"No price data found for {commodity} with the given filters."
-        
-    result = [f"Prices for {commodity}:"]
-    for p in prices:
-        result.append(
-            f"- {p.state}, {p.district}, {p.market} | "
-            f"Variety: {p.variety} | "
-            f"Modal Price: ₹{p.modal_price}/quintal (Min: ₹{p.min_price}, Max: ₹{p.max_price})"
+    try:
+        if date:
+            obs = client.get_prices(commodity, state, district, from_date=date, to_date=date)
+            day = date
+        else:
+            day, obs = _latest_observations(client.get_prices(commodity, state, district))
+    except (ValueError, RuntimeError) as e:
+        return f"Error: {e}"
+
+    if not obs:
+        scope = f"{commodity} in {state}" + (f", {district}" if district else "")
+        return f"No price data found for {scope}."
+
+    lines = [f"{commodity} prices in {state} on {day}:"]
+    for o in obs:
+        lines.append(
+            f"- {o.market} ({o.district}): "
+            f"modal Rs.{o.modal_price:.0f}/qtl (min {o.min_price:.0f}, max {o.max_price:.0f})"
         )
-    
-    return "\n".join(result)
+    return "\n".join(lines)
+
 
 @mcp.tool()
-def compare_markets(commodity: str, state: Optional[str] = None, top_n: int = 10) -> str:
-    """Compare prices of a commodity across different markets.
-    
-    Returns markets sorted by modal price (cheapest first).
-    Great for finding the cheapest mandi.
+def compare_markets(commodity: str, state: str, district: str, top_n: int = 10) -> str:
+    """Compare a commodity's price across mandis to find the cheapest.
+
+    Returns markets sorted cheapest-first by modal price, for the latest
+    available date. `district` is required because per-mandi prices are only
+    available at district granularity in the CEDA API.
     """
-    filters = {"commodity": commodity}
-    if state: filters["state"] = state
-        
-    prices = api_client.fetch_prices(filters=filters)
-    
-    if not prices:
-        return f"No data found to compare for {commodity}."
-        
-    # Sort prices by modal_price ascending (cheapest first)
-    sorted_prices = sorted(prices, key=lambda x: x.modal_price)
-    
-    result = [f"Top {top_n} cheapest markets for {commodity}:"]
-    for i, p in enumerate(sorted_prices[:top_n], 1):
-        result.append(f"{i}. ₹{p.modal_price}/qtl - {p.market} ({p.district}, {p.state})")
-        
-    return "\n".join(result)
+    try:
+        day, rows = _latest_observations(client.get_prices(commodity, state, district))
+    except (ValueError, RuntimeError) as e:
+        return f"Error: {e}"
+
+    if not rows:
+        return f"No data found to compare for {commodity} in {district}, {state}."
+
+    rows.sort(key=lambda o: o.modal_price)  # cheapest first
+    lines = [f"Cheapest mandis for {commodity} in {district}, {state} (on {day}):"]
+    for i, o in enumerate(rows[:top_n], 1):
+        lines.append(f"{i}. Rs.{o.modal_price:.0f}/qtl - {o.market}")
+    return "\n".join(lines)
+
 
 @mcp.tool()
-def get_price_summary(commodity: str, state: Optional[str] = None) -> str:
-    """Get a statistical summary of a commodity's price across all markets.
-    
-    Returns average, lowest, and highest prices across matching markets.
-    """
-    filters = {"commodity": commodity}
-    if state: filters["state"] = state
-        
-    prices = api_client.fetch_prices(filters=filters)
-    
-    if not prices:
-        return f"No data available to summarize for {commodity}."
-        
-    modal_prices = [p.modal_price for p in prices]
+def get_price_summary(commodity: str, state: str, district: Optional[str] = None) -> str:
+    """Get a statistical summary (avg / cheapest / dearest) of a commodity's
+    price across reporting mandis, for the latest available date."""
+    try:
+        day, rows = _latest_observations(client.get_prices(commodity, state, district))
+    except (ValueError, RuntimeError) as e:
+        return f"Error: {e}"
+
+    if not rows:
+        scope = f"{commodity} in {state}" + (f", {district}" if district else "")
+        return f"No data available to summarize for {scope}."
+
+    modal_prices = [o.modal_price for o in rows]
     avg_price = sum(modal_prices) / len(modal_prices)
-    
-    cheapest = min(prices, key=lambda x: x.modal_price)
-    expensive = max(prices, key=lambda x: x.modal_price)
-    
+    cheapest = min(rows, key=lambda o: o.modal_price)
+    dearest = max(rows, key=lambda o: o.modal_price)
+    scope = f"{commodity} in {state}" + (f", {district}" if district else "")
+
     return (
-        f"Summary for {commodity}:\n"
-        f"Total Markets Reporting: {len(prices)}\n"
-        f"Average Modal Price: ₹{avg_price:.2f}/quintal\n"
-        f"Cheapest Market: ₹{cheapest.modal_price}/qtl at {cheapest.market} ({cheapest.state})\n"
-        f"Most Expensive Market: ₹{expensive.modal_price}/qtl at {expensive.market} ({expensive.state})"
+        f"Summary for {scope} (on {day}):\n"
+        f"Markets reporting: {len(rows)}\n"
+        f"Average modal price: Rs.{avg_price:.0f}/quintal\n"
+        f"Cheapest: Rs.{cheapest.modal_price:.0f}/qtl at {cheapest.market}\n"
+        f"Dearest:  Rs.{dearest.modal_price:.0f}/qtl at {dearest.market}"
     )
+
 
 @mcp.tool()
 def list_commodities(search: Optional[str] = None) -> str:
-    """List available commodities in today's Agmarknet data."""
-    prices = api_client.fetch_prices()
-    
-    # Extract unique commodities
-    commodities = set(p.commodity for p in prices)
-    
+    """List commodities tracked by Agmarknet, optionally filtered by a search term."""
+    try:
+        commodities = client.list_commodities()
+    except (ValueError, RuntimeError) as e:
+        return f"Error: {e}"
+
+    names = sorted(c.commodity_name for c in commodities)
     if search:
-        search_lower = search.lower()
-        commodities = {c for c in commodities if search_lower in c.lower()}
-        
-    if not commodities:
+        s = search.lower()
+        names = [n for n in names if s in n.lower()]
+    if not names:
         return "No commodities found matching your search."
-        
-    sorted_comms = sorted(list(commodities))
-    return "Available Commodities:\n" + "\n".join(f"- {c}" for c in sorted_comms)
+
+    return f"Available commodities ({len(names)}):\n" + "\n".join(f"- {n}" for n in names)
+
 
 @mcp.tool()
-def list_markets(state: Optional[str] = None, commodity: Optional[str] = None) -> str:
-    """List available markets (mandis) in today's Agmarknet data."""
-    filters = {}
-    if state: filters["state"] = state
-    if commodity: filters["commodity"] = commodity
-        
-    prices = api_client.fetch_prices(filters=filters)
-    
-    # Extract unique markets
-    markets = set(f"{p.market} ({p.district}, {p.state})" for p in prices)
-    
+def list_markets(commodity: str, state: str, district: str) -> str:
+    """List the mandis (markets) that report prices for a commodity in a district."""
+    try:
+        commodity_obj = client.resolve_commodity(commodity)
+        state_id = client.resolve_state(state)
+        district_id = client.resolve_district(district, state_id)
+        markets = client.list_markets(commodity_obj.commodity_id, state_id, district_id)
+    except (ValueError, RuntimeError) as e:
+        return f"Error: {e}"
+
     if not markets:
-        return "No markets found with those filters."
-        
-    sorted_markets = sorted(list(markets))
-    return f"Available Markets (Total: {len(markets)}):\n" + "\n".join(f"- {m}" for m in sorted_markets)
+        return f"No mandis found for {commodity} in {district}, {state}."
+
+    names = sorted(m.market_name for m in markets)
+    return (
+        f"Mandis reporting {commodity} in {district}, {state} ({len(names)}):\n"
+        + "\n".join(f"- {n}" for n in names)
+    )
+
 
 def main():
     """Entry point for the MCP server."""
-    # Runs the server using standard input/output (stdio)
+    # Runs the server using standard input/output (stdio) transport.
     mcp.run()
+
 
 if __name__ == "__main__":
     main()

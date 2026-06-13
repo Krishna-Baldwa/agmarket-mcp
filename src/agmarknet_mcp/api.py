@@ -5,119 +5,11 @@ from datetime import date, timedelta
 from typing import List, Dict, Optional, Callable
 # pyrefly: ignore [missing-import]
 from dotenv import load_dotenv
-from .models import (
-    CommodityPrice,
-    ApiResponse,
-    Commodity,
-    Geography,
-    Market,
-    PriceRecord,
-    PriceObservation,
-)
+from .models import Commodity, Geography, Market, PriceRecord, PriceObservation
 
 # Load variables from a local .env file (e.g. CEDA_API_KEY) into the
 # environment as soon as this module is imported, so os.getenv() can find them.
 load_dotenv()
-
-# Mock data to use while data.gov.in is unresponsive
-MOCK_DATA = [
-    {
-        "state": "Maharashtra",
-        "district": "Pune",
-        "market": "Pune",
-        "commodity": "Tomato",
-        "variety": "Local",
-        "arrival_date": "13/06/2026",
-        "min_price": 2000.0,
-        "max_price": 3000.0,
-        "modal_price": 2500.0
-    },
-    {
-        "state": "Maharashtra",
-        "district": "Nashik",
-        "market": "Lasalgaon",
-        "commodity": "Onion",
-        "variety": "Red",
-        "arrival_date": "13/06/2026",
-        "min_price": 1500.0,
-        "max_price": 2000.0,
-        "modal_price": 1800.0
-    },
-    {
-        "state": "Gujarat",
-        "district": "Surat",
-        "market": "Surat",
-        "commodity": "Tomato",
-        "variety": "Local",
-        "arrival_date": "13/06/2026",
-        "min_price": 1800.0,
-        "max_price": 2800.0,
-        "modal_price": 2200.0
-    }
-]
-
-class AgmarknetClient:
-    """Client for the data.gov.in Agmarknet API."""
-    
-    # This is the specific Resource ID for the daily commodity prices dataset on data.gov.in
-    BASE_URL = "https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070"
-    
-    def __init__(self, api_key: str = None, use_mock: bool = True):
-        """
-        Initialize the client. By default, it uses Mock data since the API goes down often.
-        """
-        self.api_key = api_key or os.getenv("DATA_GOV_IN_API_KEY")
-        self.use_mock = use_mock
-        
-    def fetch_prices(self, limit: int = 100, filters: Optional[Dict[str, str]] = None) -> List[CommodityPrice]:
-        """Fetch commodity prices from the API or return mock data."""
-        
-        # 1. Mock Path (when API is down or in testing)
-        if self.use_mock:
-            results = MOCK_DATA
-            
-            # Apply filters manually to mock data
-            if filters:
-                for key, value in filters.items():
-                    results = [r for r in results if r.get(key, "").lower() == value.lower()]
-                    
-            return [CommodityPrice(**r) for r in results]
-
-        # 2. Real API Path
-        if not self.api_key or self.api_key == "your_api_key_here":
-            raise ValueError("API key is required to use the real data.gov.in API.")
-
-        # Construct the query parameters
-        params = {
-            "api-key": self.api_key,
-            "format": "json",
-            "limit": limit
-        }
-        
-        # Add dynamic filters (e.g. state="Maharashtra")
-        if filters:
-            for key, value in filters.items():
-                params[f"filters[{key}]"] = value
-                
-        try:
-            # Using httpx to make a synchronous GET request
-            response = httpx.get(self.BASE_URL, params=params, timeout=10.0)
-            
-            # Raise exception for bad status codes (like 404 Not Found, 500 Server Error)
-            response.raise_for_status() 
-            
-            data = response.json()
-            
-            # Validate the JSON data against our Pydantic model
-            api_response = ApiResponse(**data)
-            return api_response.records
-            
-        except httpx.RequestError as e:
-            print(f"Network error while calling data.gov.in: {e}")
-            return []
-        except Exception as e:
-            print(f"Error parsing API response: {e}")
-            return []
 
 
 class CedaClient:
@@ -246,18 +138,21 @@ class CedaClient:
     def get_prices(
         self, commodity: str, state: str, district: Optional[str] = None,
         from_date: Optional[str] = None, to_date: Optional[str] = None,
+        default_lookback_days: int = 365,
     ) -> List[PriceObservation]:
         """Fetch daily prices for a commodity, returned as name-enriched records.
 
-        Dates are 'YYYY-MM-DD' strings. If omitted, defaults to the last 30 days.
+        Dates are 'YYYY-MM-DD' strings. If omitted, defaults to the trailing
+        `default_lookback_days` (CEDA data is historical and lags by months, so
+        callers typically pick the latest date present in the result).
         `state` is required by the API; `district` is optional (omit it for a
-        state-wide query across every reporting district).
+        state-wide aggregated series).
         """
-        # 1. Default the date window to the trailing 30 days.
+        # 1. Default the date window to the trailing lookback period.
         if to_date is None:
             to_date = date.today().isoformat()
         if from_date is None:
-            from_date = (date.today() - timedelta(days=30)).isoformat()
+            from_date = (date.today() - timedelta(days=default_lookback_days)).isoformat()
 
         # 2. Resolve the names the caller gave us into the ids the API needs.
         commodity_obj = self.resolve_commodity(commodity)
@@ -287,20 +182,24 @@ class CedaClient:
         # The /prices response gives market_id but not market_name, so we fetch
         # markets once per district that actually appears in the results (this
         # is self-limiting: 1 call if a district was specified, a handful for a
-        # state-wide query) and the cache prevents repeat lookups.
+        # state-wide query) and the cache prevents repeat lookups. State-level
+        # aggregate rows have no district/market, so we skip those here.
         market_name: Dict[int, str] = {}
-        for dist_id in {r.census_district_id for r in rows}:
+        for dist_id in {r.census_district_id for r in rows if r.census_district_id}:
             for m in self.list_markets(commodity_obj.commodity_id, state_id, dist_id):
                 market_name[m.market_id] = m.market_name
 
-        # 5. Enrich each raw id-based row into a named observation.
+        # 5. Enrich each raw id-based row into a named observation. When a field
+        # is absent (state-level aggregate), fall back to a descriptive label.
         return [
             PriceObservation(
                 date=r.date[:10],  # trim the ISO timestamp down to YYYY-MM-DD
                 commodity=commodity_obj.commodity_name,
                 state=state_name.get(r.census_state_id, str(r.census_state_id)),
-                district=district_name.get(r.census_district_id, str(r.census_district_id)),
-                market=market_name.get(r.market_id, f"Market #{r.market_id}"),
+                district=(district_name.get(r.census_district_id, str(r.census_district_id))
+                          if r.census_district_id else "(all districts)"),
+                market=(market_name.get(r.market_id, f"Market #{r.market_id}")
+                        if r.market_id else "(state average)"),
                 min_price=r.min_price,
                 max_price=r.max_price,
                 modal_price=r.modal_price,
