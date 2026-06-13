@@ -29,6 +29,21 @@ def _latest_observations(
     return latest, [o for o in observations if o.date == latest]
 
 
+def _freshness_note(day: str) -> str:
+    """A prominent note so the LLM never presents stale data as current.
+
+    CEDA data is historical and lags the present by months, so "latest
+    available" may be well before today. Stating this explicitly stops the
+    model from answering a "last month / today" question with old figures
+    without flagging the gap."""
+    return (
+        f"NOTE: CEDA data is historical and updated periodically. The most "
+        f"recent data available is {day}. The figures below are for {day} — "
+        f"this is NOT today's or the current month's price. If the user asked "
+        f"about a more recent period, tell them data is only available up to {day}."
+    )
+
+
 @mcp.tool()
 def get_commodity_price(
     commodity: str,
@@ -55,7 +70,12 @@ def get_commodity_price(
         scope = f"{commodity} in {state}" + (f", {district}" if district else "")
         return f"No price data found for {scope}."
 
-    lines = [f"{commodity} prices in {state} on {day}:"]
+    # Flag staleness only when we fell back to the latest available date
+    # (i.e. the caller didn't pin a specific date).
+    lines = []
+    if not date:
+        lines.append(_freshness_note(day) + "\n")
+    lines.append(f"{commodity} prices in {state} on {day}:")
     for o in obs:
         lines.append(
             f"- {o.market} ({o.district}): "
@@ -81,7 +101,10 @@ def compare_markets(commodity: str, state: str, district: str, top_n: int = 10) 
         return f"No data found to compare for {commodity} in {district}, {state}."
 
     rows.sort(key=lambda o: o.modal_price)  # cheapest first
-    lines = [f"Cheapest mandis for {commodity} in {district}, {state} (on {day}):"]
+    lines = [
+        _freshness_note(day) + "\n",
+        f"Cheapest mandis for {commodity} in {district}, {state} (on {day}):",
+    ]
     for i, o in enumerate(rows[:top_n], 1):
         lines.append(f"{i}. Rs.{o.modal_price:.0f}/qtl - {o.market}")
     return "\n".join(lines)
@@ -107,6 +130,7 @@ def get_price_summary(commodity: str, state: str, district: Optional[str] = None
     scope = f"{commodity} in {state}" + (f", {district}" if district else "")
 
     return (
+        _freshness_note(day) + "\n\n"
         f"Summary for {scope} (on {day}):\n"
         f"Markets reporting: {len(rows)}\n"
         f"Average modal price: Rs.{avg_price:.0f}/quintal\n"
