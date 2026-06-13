@@ -10,7 +10,7 @@ This server acts as a bridge between LLMs and the Indian Government's Agmarknet 
 ## Features
 
 - **MCP Protocol Native:** Built with the official Anthropic `mcp` SDK using the modern FastMCP architecture.
-- **Graceful Degradation (Offline Mode):** Government APIs frequently block requests via Akamai WAFs or experience downtime. This server implements a robust fallback architecture that automatically switches to a cached offline dataset if the primary API is unreachable, ensuring 100% uptime for AI workflows.
+- **Graceful Degradation (Offline Mode):** Government APIs frequently block requests via Akamai WAFs or experience downtime. This server implements a robust fallback architecture that automatically switches to a sample offline dataset if the primary API is unreachable. *(Note: Until you provide a valid `data.gov.in` API key, the server uses static sample data for demonstration purposes, which does not reflect live market prices).*
 - **Strict Data Validation:** Uses `pydantic` to enforce rigid data schemas on government API payloads, preventing AI hallucinations caused by malformed data.
 
 ## Available AI Tools
