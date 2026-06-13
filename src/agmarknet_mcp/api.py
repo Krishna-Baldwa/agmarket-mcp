@@ -1,6 +1,7 @@
 # pyrefly: ignore [missing-import]
 import httpx
 import os
+import time
 from datetime import date, timedelta
 from typing import List, Dict, Optional, Callable
 # pyrefly: ignore [missing-import]
@@ -47,16 +48,55 @@ class CedaClient:
         self._geographies: Optional[List[Geography]] = None
         self._market_cache: Dict[tuple, List[Market]] = {}
 
-    # -- low-level helper ---------------------------------------------------
+    # -- low-level request + response handling ------------------------------
+
+    def _call(self, method: str, path: str,
+              json: Optional[Dict] = None, max_retries: int = 3) -> list:
+        """Make a request to the CEDA API and return its `output.data` payload.
+
+        Handles the realities of a free, shared API:
+          - retries on HTTP 429 (rate limit) with a short backoff, honouring the
+            server's `Retry-After` header when present;
+          - converts network and HTTP errors into a clear RuntimeError, which the
+            MCP tools catch and surface to the LLM as a readable message (so a
+            transient rate limit asks the model to retry, rather than crashing).
+        """
+        for attempt in range(max_retries + 1):
+            try:
+                response = self._http.request(method, path, json=json)
+            except httpx.RequestError as e:
+                raise RuntimeError(f"Network error contacting the CEDA API: {e}") from e
+
+            # Rate limited: back off and retry, unless we've used our attempts.
+            if response.status_code == 429 and attempt < max_retries:
+                retry_after = response.headers.get("Retry-After")
+                delay = float(retry_after) if retry_after else 1.5 * (attempt + 1)
+                time.sleep(delay)
+                continue
+
+            return self._unwrap(response)
+
+        # Unreachable in practice (the final attempt returns or raises above),
+        # but keeps the type checker happy.
+        raise RuntimeError("CEDA API request failed after retries.")
 
     def _unwrap(self, response: httpx.Response) -> list:
-        """Validate the HTTP response and return its `output.data` payload.
+        """Validate a single HTTP response and return its `output.data` payload.
 
         Every CEDA endpoint wraps results in the same envelope:
             {"output": {"type": "success", "message": "...", "data": [...]}}
-        so we check the status code, confirm success, and hand back `data`.
         """
-        response.raise_for_status()  # raise on any 4xx/5xx (e.g. 401 bad key)
+        if response.status_code == 429:
+            raise RuntimeError(
+                "CEDA API rate limit reached (HTTP 429). Please wait a few "
+                "seconds and try again."
+            )
+        try:
+            response.raise_for_status()  # raise on any other 4xx/5xx
+        except httpx.HTTPStatusError as e:
+            raise RuntimeError(
+                f"CEDA API request failed with HTTP {response.status_code}."
+            ) from e
         output = response.json().get("output", {})
         if output.get("type") != "success":
             raise RuntimeError(
@@ -69,14 +109,14 @@ class CedaClient:
     def list_commodities(self) -> List[Commodity]:
         """All commodities the platform tracks (id + name)."""
         if self._commodities is None:
-            data = self._unwrap(self._http.get("/agmarknet/commodities"))
+            data = self._call("GET", "/agmarknet/commodities")
             self._commodities = [Commodity(**c) for c in data]
         return self._commodities
 
     def list_geographies(self) -> List[Geography]:
         """All state+district pairings (ids + names)."""
         if self._geographies is None:
-            data = self._unwrap(self._http.get("/agmarknet/geographies"))
+            data = self._call("GET", "/agmarknet/geographies")
             self._geographies = [Geography(**g) for g in data]
         return self._geographies
 
@@ -87,12 +127,12 @@ class CedaClient:
         """Markets (mandis) reporting a commodity in one district, cached per query."""
         key = (commodity_id, state_id, district_id, indicator)
         if key not in self._market_cache:
-            data = self._unwrap(self._http.post("/agmarknet/markets", json={
+            data = self._call("POST", "/agmarknet/markets", json={
                 "commodity_id": commodity_id,
                 "state_id": state_id,
                 "district_id": district_id,
                 "indicator": indicator,
-            }))
+            })
             self._market_cache[key] = [Market(**m) for m in data]
         return self._market_cache[key]
 
@@ -168,7 +208,7 @@ class CedaClient:
 
         # 3. Call the API and validate every row against PriceRecord.
         rows = [PriceRecord(**r)
-                for r in self._unwrap(self._http.post("/agmarknet/prices", json=body))]
+                for r in self._call("POST", "/agmarknet/prices", json=body)]
         if not rows:
             return []
 
