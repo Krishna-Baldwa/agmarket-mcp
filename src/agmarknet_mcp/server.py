@@ -1,3 +1,4 @@
+from datetime import date, timedelta
 from typing import Optional, List, Tuple
 # pyrefly: ignore [missing-import]
 from mcp.server.fastmcp import FastMCP
@@ -150,6 +151,64 @@ def list_markets(commodity: str, state: str, district: str) -> str:
     return (
         f"Mandis reporting {commodity} in {district}, {state} ({len(names)}):\n"
         + "\n".join(f"- {n}" for n in names)
+    )
+
+
+@mcp.tool()
+def get_price_trend(
+    commodity: str,
+    state: str,
+    district: Optional[str] = None,
+    days: int = 30,
+) -> str:
+    """Show the price trend for a commodity over the most recent `days` of data.
+
+    Reports the daily-average modal price across the window, the window average,
+    the high/low, and the change from the start to the end of the window. This
+    relies on CEDA's historical data (the old data.gov.in endpoint only had
+    today's prices). `state` is required; add `district` to focus on one region.
+    """
+    try:
+        obs = client.get_prices(commodity, state, district)
+    except (ValueError, RuntimeError) as e:
+        return f"Error: {e}"
+
+    scope = f"{commodity} in {state}" + (f", {district}" if district else "")
+    if not obs:
+        return f"No historical data found for {scope}."
+
+    # Collapse to one number per day: the average modal price across every
+    # market that reported on that date (a district query returns many markets
+    # per day; a state query already returns one aggregate row per day).
+    by_date: dict = {}
+    for o in obs:
+        by_date.setdefault(o.date, []).append(o.modal_price)
+    daily = {d: sum(v) / len(v) for d, v in by_date.items()}
+
+    # Keep only the most recent `days` calendar days of available data.
+    latest = max(daily)
+    cutoff = (date.fromisoformat(latest) - timedelta(days=days)).isoformat()
+    series = sorted((d, p) for d, p in daily.items() if d >= cutoff)
+    if not series:
+        return f"No data in the last {days} days of available data for {scope}."
+
+    prices = [p for _, p in series]
+    avg = sum(prices) / len(prices)
+    (first_d, first_p), (last_d, last_p) = series[0], series[-1]
+    lo_d, lo_p = min(series, key=lambda x: x[1])
+    hi_d, hi_p = max(series, key=lambda x: x[1])
+    change = last_p - first_p
+    pct = (change / first_p * 100) if first_p else 0.0
+    direction = "up" if change > 0 else "down" if change < 0 else "flat"
+
+    return (
+        f"Price trend for {scope} ({first_d} to {last_d}, "
+        f"{len(series)} days with data):\n"
+        f"Average modal price: Rs.{avg:.0f}/quintal\n"
+        f"Lowest:  Rs.{lo_p:.0f}/qtl (on {lo_d})\n"
+        f"Highest: Rs.{hi_p:.0f}/qtl (on {hi_d})\n"
+        f"Change over window: Rs.{first_p:.0f} -> Rs.{last_p:.0f} "
+        f"({direction} {abs(pct):.1f}%)"
     )
 
 
